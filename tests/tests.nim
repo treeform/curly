@@ -35,7 +35,7 @@ block:
   let curl = newCurly()
 
   var batch: RequestBatch
-  batch.get("https://www.microsoft.com")
+  batch.get("https://example.com")
   batch.get(badurl, tag = "tag_test")
   batch.get("https://news.ycombinator.com/")
 
