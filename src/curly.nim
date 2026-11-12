@@ -159,6 +159,13 @@ proc destroy(rw: RequestWrap) {.gcsafe.} =
   `=destroy`(rw[])
   deallocShared(rw)
 
+proc copyForCaller(value: string): string =
+  ## A response can outlive the worker thread and its allocator. Copy bytes
+  ## into the receiving thread's allocator instead of moving worker storage.
+  result = newString(value.len)
+  if value.len > 0:
+    copyMem(result[0].addr, value[0].unsafeAddr, value.len)
+
 {.push stackTrace: off.}
 
 proc curlHeaderWriteFn(
@@ -184,16 +191,12 @@ proc curlBodyWriteFn(
   if request.streamState.isSome:
     if not request.streamstate.get.signaledAfterHeaders:
       discard request.easyHandle.easy_setopt(OPT_TIMEOUT, 0) # Remove timeout
-      let tmp4 = allocShared0(4)
-      discard request.easyHandle.easy_getinfo(INFO_RESPONSE_CODE, tmp4)
-      var httpCode: uint32
-      copyMem(httpCode.addr, tmp4, 4)
-      deallocShared(tmp4)
+      var httpCode: clong
+      discard request.easyHandle.easy_getinfo(INFO_RESPONSE_CODE, httpCode.addr)
       request.response.code = httpCode.int
-      let tmpcstring = cast[ptr cstring](allocShared0(sizeof(cstring)))
-      discard request.easyHandle.easy_getinfo(INFO_EFFECTIVE_URL, tmpcstring)
-      request.response.url = $tmpcstring[]
-      deallocShared(tmpcstring)
+      var effectiveUrl: cstring
+      discard request.easyHandle.easy_getinfo(INFO_EFFECTIVE_URL, effectiveUrl.addr)
+      request.response.url = $effectiveUrl
       request.waitGroup.done()
       request.streamstate.get.signaledAfterHeaders = true
     withLock request.streamState.get.lock:
@@ -252,10 +255,6 @@ proc threadProc(curl: Curly) {.raises: [].} =
     var newSet = oldSet
     discard sigaddset(newSet, SIGPIPE)
     discard pthread_sigmask(SIG_BLOCK, newSet, oldSet) # Block SIGPIPE
-
-  let
-    tmp4 = allocShared0(4)
-    tmpcstring = cast[ptr cstring](allocShared0(sizeof(cstring)))
 
   var
     dequeued: seq[RequestWrap]
@@ -365,39 +364,39 @@ proc threadProc(curl: Curly) {.raises: [].} =
       if m.msg != MSG_DONE:
         continue
 
-      let mc = multi_remove_handle(curl.multiHandle, m.easy_handle)
+      # CURLMsg storage expires when its easy handle is removed.
+      let
+        easyHandle = m.easy_handle
+        code = cast[Code](m.whatever)
+        mc = multi_remove_handle(curl.multiHandle, easyHandle)
       if mc != M_OK:
         # This should never happen?
         echo "Unexpected libcurl multi_remove_handle error: ",
           mc, ' ', multi_strerror(mc)
         continue
 
-      let request = curl.inFlight.getOrDefault(m.easy_handle, nil)
-      curl.inFlight.del(m.easy_handle)
+      let request = curl.inFlight.getOrDefault(easyHandle, nil)
+      curl.inFlight.del(easyHandle)
       if request == nil:
         # This should never happen
         echo "Unrecognized libcurl easy_handle from multi_info_read"
         continue
 
       # This request has completed
-      let code = cast[Code](m.whatever)
       if code == E_OK:
-        # Avoid SIGSEGV on Mac with -d:release and a memory leak on Linux
-        zeroMem(tmp4, 4)
-        discard m.easy_handle.easy_getinfo(INFO_RESPONSE_CODE, tmp4)
-        var httpCode: uint32
-        copyMem(httpCode.addr, tmp4, 4)
+        var httpCode: clong
+        discard easyHandle.easy_getinfo(INFO_RESPONSE_CODE, httpCode.addr)
         request.response.code = httpCode.int
-        zeroMem(tmpcstring, sizeof(cstring))
-        discard m.easy_handle.easy_getinfo(INFO_EFFECTIVE_URL, tmpcstring)
-        request.response.url = $tmpcstring[]
+        var effectiveUrl: cstring
+        discard easyHandle.easy_getinfo(INFO_EFFECTIVE_URL, effectiveUrl.addr)
+        request.response.url = $effectiveUrl
       else:
         request.error =
           $easy_strerror(code) & ' ' & request.verb & ' ' & request.url
 
       # Reset this easy_handle and add it back as available
-      easy_reset(m.easy_handle)
-      curl.availableEasyHandles.addLast(m.easy_handle)
+      easy_reset(easyHandle)
+      curl.availableEasyHandles.addLast(easyHandle)
 
       if request.streamState.isSome:
         withLock request.streamState.get.lock:
@@ -434,12 +433,25 @@ proc threadProc(curl: Curly) {.raises: [].} =
         acquire(curl.lock)
         while curl.queue.len == 0 and not curl.closeCalled:
           wait(curl.cond, curl.lock)
-        var closeCalled = curl.closeCalled
+        let finished = curl.closeCalled and curl.queue.len == 0
         release(curl.lock)
         # Close has been called and there are no running handles, break the
         # loop and let this thread join.
-        if closeCalled:
+        if finished:
           break
+
+  # These containers can grow on the worker, so destroy their storage before
+  # its thread-local allocator disappears. Unclaimed responses are no longer
+  # accessible after close and must be freed here too.
+  while curl.requestsCompleted.len > 0:
+    destroy curl.requestsCompleted.popFirst()
+  while curl.availableEasyHandles.len > 0:
+    easy_cleanup(curl.availableEasyHandles.popFirst())
+  discard multi_cleanup(curl.multiHandle)
+  reset(curl.availableEasyHandles)
+  reset(curl.queue)
+  reset(curl.inFlight)
+  reset(curl.requestsCompleted)
 
 proc newCurly*(maxInFlight = 16): Curly =
   ## Creates a new Curly instance that will run up to `maxInFlight` HTTP
@@ -459,9 +471,24 @@ proc newCurly*(maxInFlight = 16): Curly =
     result.availableEasyHandles.addLast(easy_init())
   createThread(result.thread, threadProc, result)
 
+proc clearQueue*(curl: Curly) {.gcsafe.} =
+  ## Clears the request queue, unblocking any threads waiting on responses.
+  ## All queued requests are completed with an error.
+  withLock curl.lock:
+    while curl.queue.len > 0:
+      let rw = curl.queue.popFirst()
+      rw.error = "Canceled in clearQueue"
+      if rw.waitGroup != nil:
+        rw.waitGroup.done()
+      else:
+        curl.requestsCompleted.addLast(rw)
+
 proc close*(curl: Curly) =
   ## Blocks until all in-flight and queued requests complete, then
   ## closes all libcurl handles and deallocates the Curly object.
+  ## Clients with no request capacity cancel their queued requests instead.
+  if curl.maxInFlight <= 0:
+    curl.clearQueue()
   withLock curl.lock:
     curl.closeCalled = true
   signal(curl.cond)
@@ -469,10 +496,6 @@ proc close*(curl: Curly) =
   deinitLock(curl.lock)
   deinitCond(curl.cond)
   deinitCond(curl.requestCompletedCond)
-  while curl.availableEasyHandles.len > 0:
-    let easyHandle = curl.availableEasyHandles.popFirst()
-    easy_cleanup(easyHandle)
-  discard multi_cleanup(curl.multiHandle)
   `=destroy`(curl[])
   deallocShared(curl)
 
@@ -491,18 +514,6 @@ proc queueLen*(curl: Curly): int {.gcsafe.} =
   ## Returns the number of queued requests.
   withLock curl.lock:
     result = curl.queue.len
-
-proc clearQueue*(curl: Curly) {.gcsafe.} =
-  ## Clears the request queue, unblocking any threads waiting on responses.
-  ## All queued requests are completed with an error.
-  withLock curl.lock:
-    while curl.queue.len > 0:
-      let rw = curl.queue.popFirst()
-      rw.error = "Canceled in clearQueue"
-      if rw.waitGroup != nil:
-        rw.waitGroup.done()
-      else:
-        curl.requestsCompleted.addLast(rw)
 
 proc request*(
   curl: Curly,
@@ -545,17 +556,18 @@ proc request*(
 
   if rw.error == "":
     result.code = rw.response.code
-    result.url = rw.response.url
+    result.url = copyForCaller(rw.response.url)
     result.request.verb = rw.verb
     result.request.url = rw.url
     addHeaders(result.headers, rw.responseHeadersForLibcurl)
     result.internal = rw
   else:
+    let error = copyForCaller(rw.error)
     deinitLock(rw.streamState.get.lock)
     deinitCond(rw.streamState.get.cond)
     destroy rw.waitGroup
     destroy rw
-    raise newException(CatchableError, move rw.error)
+    raise newException(CatchableError, error)
 
 proc read*(stream: ResponseStream, buffer: var string): int {.gcsafe.} =
   ## Adds new bytes received to `buffer`. Returns how many bytes were added.
@@ -567,7 +579,7 @@ proc read*(stream: ResponseStream, buffer: var string): int {.gcsafe.} =
     stream.internal.error == "":
     wait(stream.internal.streamState.get.cond, stream.internal.streamState.get.lock)
   tmp = move stream.internal.responseBodyForLibcurl
-  error = stream.internal.error
+  error = copyForCaller(stream.internal.error)
   release(stream.internal.streamState.get.lock)
 
   if error == "":
@@ -582,7 +594,7 @@ proc read*(stream: ResponseStream, buffer: var string): int {.gcsafe.} =
           tmp.len
         )
       else:
-        buffer = move tmp
+        buffer = copyForCaller(tmp)
   else:
     raise newException(CatchableError, move error)
 
@@ -628,15 +640,16 @@ proc makeRequest*(
 
   try:
     if rw.error == "":
-      result = move rw.response
+      result.code = rw.response.code
+      result.url = copyForCaller(rw.response.url)
       result.request.verb = move rw.verb
       result.request.url = move rw.url
       addHeaders(result.headers, rw.responseHeadersForLibcurl)
-      result.body = move rw.responseBodyForLibcurl
+      result.body = copyForCaller(rw.responseBodyForLibcurl)
       if result.headers["Content-Encoding"] == "gzip":
         result.body = uncompress(result.body, dfGzip)
     else:
-      raise newException(CatchableError, move rw.error)
+      raise newException(CatchableError, copyForCaller(rw.error))
   finally:
     destroy rw.waitGroup
     destroy rw
@@ -695,20 +708,23 @@ proc head*(
 proc unwrapResponse(
   rw: RequestWrap
 ): tuple[response: Response, error: string] =
-  var response = move rw.response
+  var response = Response(
+    code: rw.response.code,
+    url: copyForCaller(rw.response.url)
+  )
   response.request.verb = move rw.verb
   response.request.url = move rw.url
   response.request.tag = move rw.tag
   if rw.error == "":
     addHeaders(response.headers, rw.responseHeadersForLibcurl)
-    response.body = move rw.responseBodyForLibcurl
+    response.body = copyForCaller(rw.responseBodyForLibcurl)
     if response.headers["Content-Encoding"] == "gzip":
       try:
         response.body = uncompress(response.body, dfGzip)
       except:
         rw.error = "Uncompressing gzip'ed response body failed: " &
           getCurrentExceptionMsg()
-  (move response, move rw.error)
+  (move response, copyForCaller(rw.error))
 
 proc makeRequests*(
   curl: Curly,
@@ -1092,17 +1108,12 @@ proc makeRequest*(
   try:
     let ret = curl.easy_perform()
     if ret == E_OK:
-      # This avoids a SIGSEGV on Mac with -d:release and a memory leak on Linux
-      let tmp4 = allocShared0(4)
-      discard curl.easy_getinfo(INFO_RESPONSE_CODE, tmp4)
-      var httpCode: uint32
-      copyMem(httpCode.addr, tmp4, 4)
-      deallocShared(tmp4)
+      var httpCode: clong
+      discard curl.easy_getinfo(INFO_RESPONSE_CODE, httpCode.addr)
       result.code = httpCode.int
-      let tmpcstring = cast[ptr cstring](allocShared0(sizeof(cstring)))
-      discard curl.easy_getinfo(INFO_EFFECTIVE_URL, tmpcstring)
-      result.url = $tmpcstring[]
-      deallocShared(tmpcstring)
+      var effectiveUrl: cstring
+      discard curl.easy_getinfo(INFO_EFFECTIVE_URL, effectiveUrl.addr)
+      result.url = $effectiveUrl
       addHeaders(result.headers, headerWrap.str)
       result.body = move bodyWrap.str
       if result.headers["Content-Encoding"] == "gzip":
