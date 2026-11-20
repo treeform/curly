@@ -551,11 +551,12 @@ proc request*(
     addHeaders(result.headers, rw.responseHeadersForLibcurl)
     result.internal = rw
   else:
+    let error = move rw.error
     deinitLock(rw.streamState.get.lock)
     deinitCond(rw.streamState.get.cond)
     destroy rw.waitGroup
     destroy rw
-    raise newException(CatchableError, move rw.error)
+    raise newException(CatchableError, error)
 
 proc read*(stream: ResponseStream, buffer: var string): int {.gcsafe.} =
   ## Adds new bytes received to `buffer`. Returns how many bytes were added.
